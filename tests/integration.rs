@@ -5,6 +5,7 @@
 //!
 //! Run with: GR2_TEST_DIR=/path/to/models cargo test -- --ignored
 
+use gr2_rs::element::Value;
 use gr2_rs::reader::Gr2File;
 use std::path::PathBuf;
 
@@ -245,4 +246,159 @@ fn oodle1_sections_decompress_to_expected_size() {
     let total: usize = gr2.sections.iter().map(|s| s.header.uncompressed_size as usize).sum();
     assert_eq!(gr2.flat.len(), total,
         "flat buffer size should equal sum of decompressed section sizes");
+}
+
+#[test]
+#[ignore]
+fn resolve_variant_array_vertices() {
+    let path = first_model();
+    let gr2 = Gr2File::load(&path)
+        .unwrap_or_else(|e| panic!("failed to parse {}: {e}", path.display()));
+
+    let fields = gr2.extract_root().unwrap();
+
+    // Find Meshes array
+    let meshes_field = fields.iter().find(|f| f.name == "Meshes");
+    let Some(meshes_field) = meshes_field else {
+        eprintln!("note: {} has no Meshes field, skipping", path.display());
+        return;
+    };
+
+    // Resolve the Meshes array — need its type from the root type def
+    let root_type_off = gr2.resolve_ref(gr2.header.root_type).unwrap();
+    let root_members = gr2.walk_struct_def(root_type_off).unwrap();
+    let meshes_member = root_members.iter().find(|m| m.name == "Meshes").unwrap();
+
+    let meshes = match gr2.resolve_array(&meshes_field.value, meshes_member.children_ptr as usize) {
+        Ok(m) => m,
+        Err(_) => {
+            eprintln!("note: {} Meshes array is empty or unresolvable", path.display());
+            return;
+        }
+    };
+
+    assert!(!meshes.is_empty(), "model should have at least one mesh");
+
+    // For each mesh, find PrimaryVertexData (Reference), resolve it,
+    // then find Vertices (ReferenceToVariantArray) and resolve that.
+    let mesh_type_members = gr2.walk_struct_def(meshes_member.children_ptr as usize).unwrap();
+    let pvd_member = mesh_type_members.iter().find(|m| m.name == "PrimaryVertexData");
+    let Some(pvd_member) = pvd_member else {
+        eprintln!("note: mesh type has no PrimaryVertexData field");
+        return;
+    };
+
+    for (i, mesh) in meshes.iter().enumerate() {
+        let mesh_name = mesh.iter()
+            .find(|f| f.name == "Name")
+            .and_then(|f| if let Value::String(Some(s)) = &f.value { Some(s.as_str()) } else { None })
+            .unwrap_or("<unnamed>");
+
+        let pvd_field = mesh.iter().find(|f| f.name == "PrimaryVertexData");
+        let Some(pvd_field) = pvd_field else { continue };
+
+        let pvd = match gr2.resolve_value(&pvd_field.value, pvd_member.children_ptr as usize) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let vertices_field = pvd.iter().find(|f| f.name == "Vertices");
+        let Some(vertices_field) = vertices_field else { continue };
+
+        if let Value::ReferenceToVariantArray { type_offset: Some(_), count, data_offset: Some(_) } = &vertices_field.value {
+            let verts = gr2.resolve_variant_array(&vertices_field.value)
+                .unwrap_or_else(|e| panic!("failed to resolve vertices for mesh {i} ({mesh_name}): {e}"));
+            assert_eq!(verts.len(), *count as usize);
+            eprintln!("mesh {i} ({mesh_name}): {count} vertices, {} components each", verts[0].len());
+        }
+    }
+}
+
+#[test]
+#[ignore]
+fn resolve_variant_array_all_models() {
+    let files = model_files();
+    let mut total_meshes = 0;
+    let mut total_verts = 0;
+    let mut failures = Vec::new();
+
+    for path in &files {
+        let gr2 = match Gr2File::load(path) {
+            Ok(g) => g,
+            Err(_) => continue,
+        };
+        let fields = match gr2.extract_root() {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+
+        let meshes_field = match fields.iter().find(|f| f.name == "Meshes") {
+            Some(f) => f,
+            None => continue,
+        };
+
+        let root_type_off = match gr2.resolve_ref(gr2.header.root_type) {
+            Some(o) => o,
+            None => continue,
+        };
+        let root_members = match gr2.walk_struct_def(root_type_off) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let meshes_member = match root_members.iter().find(|m| m.name == "Meshes") {
+            Some(m) => m,
+            None => continue,
+        };
+
+        let meshes = match gr2.resolve_array(&meshes_field.value, meshes_member.children_ptr as usize) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+
+        let mesh_type_members = match gr2.walk_struct_def(meshes_member.children_ptr as usize) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let pvd_member = match mesh_type_members.iter().find(|m| m.name == "PrimaryVertexData") {
+            Some(m) => m,
+            None => continue,
+        };
+
+        for mesh in &meshes {
+            total_meshes += 1;
+
+            let pvd_field = match mesh.iter().find(|f| f.name == "PrimaryVertexData") {
+                Some(f) => f,
+                None => continue,
+            };
+            let pvd = match gr2.resolve_value(&pvd_field.value, pvd_member.children_ptr as usize) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let vertices_field = match pvd.iter().find(|f| f.name == "Vertices") {
+                Some(f) => f,
+                None => continue,
+            };
+
+            if let Value::ReferenceToVariantArray { type_offset: Some(_), count, data_offset: Some(_) } = &vertices_field.value {
+                match gr2.resolve_variant_array(&vertices_field.value) {
+                    Ok(verts) => {
+                        assert_eq!(verts.len(), *count as usize);
+                        total_verts += verts.len();
+                    }
+                    Err(e) => {
+                        failures.push(format!("{}: {e}", path.display()));
+                    }
+                }
+            }
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "{} vertex extraction failures:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+    eprintln!("resolved vertices for {total_meshes} meshes ({total_verts} total vertices) across {} files", files.len());
 }

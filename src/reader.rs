@@ -775,9 +775,14 @@ impl Gr2File {
             Value::VariantReference { .. } => {
                 Err(Error::InvalidType("null variant reference".into()))
             }
-            Value::ReferenceToArray { offset: Some(data_off), .. }
-            | Value::ArrayOfReferences { offset: Some(data_off), .. } => {
+            Value::ReferenceToArray { offset: Some(data_off), .. } => {
                 self.extract_struct(type_offset, *data_off)
+            }
+            Value::ArrayOfReferences { offset: Some(arr_off), .. } => {
+                // Array of pointers — dereference the first pointer.
+                let ptr = self.read_ptr(*arr_off)
+                    .ok_or(Error::InvalidType("null pointer in ArrayOfReferences".into()))?;
+                self.extract_struct(type_offset, ptr)
             }
             Value::ReferenceToArray { offset: None, .. }
             | Value::ArrayOfReferences { offset: None, .. } => {
@@ -789,42 +794,104 @@ impl Gr2File {
         }
     }
 
-    /// Resolve a `Value::ReferenceToArray` into a `Vec` of struct element lists.
+    /// Resolve a `Value::ReferenceToArray` or `Value::ArrayOfReferences` into
+    /// a `Vec` of struct element lists.
     ///
-    /// Each element is extracted as a `Vec<Field>`.
+    /// - `ReferenceToArray`: data is a contiguous array of structs.
+    /// - `ArrayOfReferences`: data is an array of pointers, each pointing to a struct.
     pub fn resolve_array(
         &self,
         value: &Value,
         type_offset: usize,
     ) -> Result<Vec<Vec<Field>>, Error> {
-        let (count, data_off) = match value {
+        match value {
             Value::ReferenceToArray {
                 count,
-                offset: Some(off),
+                offset: Some(data_off),
+            } => {
+                if *count > MAX_ARRAY_COUNT {
+                    return Err(Error::InvalidType(format!(
+                        "array count {count} exceeds maximum ({MAX_ARRAY_COUNT})"
+                    )));
+                }
+                let elem_size = self.struct_data_size(type_offset)?;
+                let mut results = Vec::with_capacity(*count as usize);
+                for i in 0..*count as usize {
+                    let fields = self.extract_struct(type_offset, data_off + i * elem_size)?;
+                    results.push(fields);
+                }
+                Ok(results)
             }
-            | Value::ArrayOfReferences {
+            Value::ArrayOfReferences {
                 count,
-                offset: Some(off),
-            } => (*count, *off),
+                offset: Some(arr_off),
+            } => {
+                if *count > MAX_ARRAY_COUNT {
+                    return Err(Error::InvalidType(format!(
+                        "array count {count} exceeds maximum ({MAX_ARRAY_COUNT})"
+                    )));
+                }
+                let p = self.pointer_width.size();
+                let mut results = Vec::with_capacity(*count as usize);
+                for i in 0..*count as usize {
+                    let ptr = self.read_ptr(arr_off + i * p)
+                        .ok_or(Error::InvalidType(
+                            "null pointer in ArrayOfReferences".into(),
+                        ))?;
+                    let fields = self.extract_struct(type_offset, ptr)?;
+                    results.push(fields);
+                }
+                Ok(results)
+            }
             Value::ReferenceToArray { offset: None, .. }
             | Value::ArrayOfReferences { offset: None, .. } => {
-                return Err(Error::InvalidType("null array reference".into()));
+                Err(Error::InvalidType("null array reference".into()))
+            }
+            _ => Err(Error::InvalidType(format!(
+                "value is not a ReferenceToArray or ArrayOfReferences: {value:?}"
+            ))),
+        }
+    }
+
+    /// Resolve a `ReferenceToVariantArray` into its elements.
+    ///
+    /// Unlike `resolve_array`, the element type is embedded in the value itself
+    /// (polymorphic array), so no external `type_offset` parameter is needed.
+    pub fn resolve_variant_array(
+        &self,
+        value: &Value,
+    ) -> Result<Vec<Vec<Field>>, Error> {
+        let (type_off, count, data_off) = match value {
+            Value::ReferenceToVariantArray {
+                type_offset: Some(toff),
+                count,
+                data_offset: Some(doff),
+            } => (*toff, *count, *doff),
+            Value::ReferenceToVariantArray {
+                type_offset: None, ..
+            }
+            | Value::ReferenceToVariantArray {
+                data_offset: None, ..
+            } => {
+                return Err(Error::InvalidType(
+                    "null variant array reference".into(),
+                ));
             }
             _ => {
                 return Err(Error::InvalidType(format!(
-                    "value is not a ReferenceToArray or ArrayOfReferences: {value:?}"
+                    "value is not a ReferenceToVariantArray: {value:?}"
                 )));
             }
         };
         if count > MAX_ARRAY_COUNT {
             return Err(Error::InvalidType(format!(
-                "array count {count} exceeds maximum ({MAX_ARRAY_COUNT})"
+                "variant array count {count} exceeds maximum ({MAX_ARRAY_COUNT})"
             )));
         }
-        let elem_size = self.struct_data_size(type_offset)?;
+        let elem_size = self.struct_data_size(type_off)?;
         let mut results = Vec::with_capacity(count as usize);
         for i in 0..count as usize {
-            let fields = self.extract_struct(type_offset, data_off + i * elem_size)?;
+            let fields = self.extract_struct(type_off, data_off + i * elem_size)?;
             results.push(fields);
         }
         Ok(results)
@@ -2114,6 +2181,134 @@ mod tests {
         assert_eq!(results[0][0].value, Value::Int32(10));
         assert_eq!(results[1][0].value, Value::Int32(20));
         assert_eq!(results[2][0].value, Value::Int32(30));
+    }
+
+    #[test]
+    fn resolve_array_of_references() {
+        // ArrayOfReferences: pointer array at 160, each pointer targets a struct.
+        // Type def for Int32 "n" at offset 100.
+        let mut flat = vec![0u8; 320];
+        flat[200] = b'n'; flat[201] = 0;
+
+        flat[100..104].copy_from_slice(&(MemberType::Int32 as u32).to_le_bytes());
+        flat[104..108].copy_from_slice(&200u32.to_le_bytes());
+        flat[112..116].copy_from_slice(&1u32.to_le_bytes());
+        // None terminator at 132 (already zero)
+
+        // Struct instances at offsets 240, 260, 280
+        flat[240..244].copy_from_slice(&100i32.to_le_bytes());
+        flat[260..264].copy_from_slice(&200i32.to_le_bytes());
+        flat[280..284].copy_from_slice(&300i32.to_le_bytes());
+
+        // Pointer array at 160: [240, 260, 280] as u32 pointers
+        flat[160..164].copy_from_slice(&240u32.to_le_bytes());
+        flat[164..168].copy_from_slice(&260u32.to_le_bytes());
+        flat[168..172].copy_from_slice(&280u32.to_le_bytes());
+
+        let gr2 = make_gr2_p32(flat);
+        let arr_val = Value::ArrayOfReferences { count: 3, offset: Some(160) };
+        let results = gr2.resolve_array(&arr_val, 100).unwrap();
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0][0].value, Value::Int32(100));
+        assert_eq!(results[1][0].value, Value::Int32(200));
+        assert_eq!(results[2][0].value, Value::Int32(300));
+    }
+
+    #[test]
+    fn resolve_value_array_of_references() {
+        // resolve_value on ArrayOfReferences should dereference the first pointer.
+        let mut flat = vec![0u8; 320];
+        flat[200] = b'n'; flat[201] = 0;
+
+        flat[100..104].copy_from_slice(&(MemberType::Int32 as u32).to_le_bytes());
+        flat[104..108].copy_from_slice(&200u32.to_le_bytes());
+        flat[112..116].copy_from_slice(&1u32.to_le_bytes());
+
+        // Struct at 240: i32 = 42
+        flat[240..244].copy_from_slice(&42i32.to_le_bytes());
+        // Pointer at 160 -> 240
+        flat[160..164].copy_from_slice(&240u32.to_le_bytes());
+
+        let gr2 = make_gr2_p32(flat);
+        let val = Value::ArrayOfReferences { count: 1, offset: Some(160) };
+        let fields = gr2.resolve_value(&val, 100).unwrap();
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].value, Value::Int32(42));
+    }
+
+    #[test]
+    fn resolve_variant_array_basic() {
+        // Type def for Int32 "n" at offset 100, data for 3 elements at 160
+        let mut flat = vec![0u8; 256];
+        flat[200] = b'n'; flat[201] = 0;
+
+        flat[100..104].copy_from_slice(&(MemberType::Int32 as u32).to_le_bytes());
+        flat[104..108].copy_from_slice(&200u32.to_le_bytes());
+        flat[112..116].copy_from_slice(&1u32.to_le_bytes());
+        // None terminator at 132 (already zero)
+
+        flat[160..164].copy_from_slice(&10i32.to_le_bytes());
+        flat[164..168].copy_from_slice(&20i32.to_le_bytes());
+        flat[168..172].copy_from_slice(&30i32.to_le_bytes());
+
+        let gr2 = make_gr2_p32(flat);
+        let val = Value::ReferenceToVariantArray {
+            type_offset: Some(100),
+            count: 3,
+            data_offset: Some(160),
+        };
+        let results = gr2.resolve_variant_array(&val).unwrap();
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0][0].value, Value::Int32(10));
+        assert_eq!(results[1][0].value, Value::Int32(20));
+        assert_eq!(results[2][0].value, Value::Int32(30));
+    }
+
+    #[test]
+    fn resolve_variant_array_null_type() {
+        let gr2 = make_gr2(vec![0u8; 16]);
+        let val = Value::ReferenceToVariantArray {
+            type_offset: None,
+            count: 1,
+            data_offset: Some(0),
+        };
+        assert!(gr2.resolve_variant_array(&val).is_err());
+    }
+
+    #[test]
+    fn resolve_variant_array_null_data() {
+        let gr2 = make_gr2(vec![0u8; 16]);
+        let val = Value::ReferenceToVariantArray {
+            type_offset: Some(0),
+            count: 1,
+            data_offset: None,
+        };
+        assert!(gr2.resolve_variant_array(&val).is_err());
+    }
+
+    #[test]
+    fn resolve_variant_array_wrong_type() {
+        let gr2 = make_gr2(vec![0u8; 16]);
+        let val = Value::Int32(5);
+        assert!(gr2.resolve_variant_array(&val).is_err());
+    }
+
+    #[test]
+    fn resolve_variant_array_empty() {
+        let mut flat = vec![0u8; 256];
+        flat[200] = b'x'; flat[201] = 0;
+        flat[100..104].copy_from_slice(&(MemberType::Int32 as u32).to_le_bytes());
+        flat[104..108].copy_from_slice(&200u32.to_le_bytes());
+        flat[112..116].copy_from_slice(&1u32.to_le_bytes());
+
+        let gr2 = make_gr2_p32(flat);
+        let val = Value::ReferenceToVariantArray {
+            type_offset: Some(100),
+            count: 0,
+            data_offset: Some(160),
+        };
+        let results = gr2.resolve_variant_array(&val).unwrap();
+        assert!(results.is_empty());
     }
 
     #[test]
